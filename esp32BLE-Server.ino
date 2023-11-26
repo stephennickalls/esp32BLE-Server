@@ -16,6 +16,8 @@ BLE2902 *pBLE2902_humidity;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 
+int counter = 0;
+
 #define DHTPIN 4  
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
@@ -40,6 +42,8 @@ class MyServerCallbacks: public BLEServerCallbacks {
 void setup() {
   Serial.begin(115200);
   dht.begin();
+
+  esp_sleep_enable_timer_wakeup(1 * 20 * 1000000);
 
   // Create the BLE Device
   BLEDevice::init("ESP32");
@@ -98,10 +102,19 @@ void setup() {
 
 void loop() {
 
-    // Wake up and read data from the DHT sensor
+  Serial.print("awake: ");
+  Serial.println(counter);
+
+  if(counter == 20){ // if esp has been awake for 20s then it should sleep
+    counter = 0;
+    Serial.println("going to sleep now");
+    delay(1000);
+    esp_deep_sleep_start();
+  }
+
+    // read data from the DHT sensor
     float temp = dht.readTemperature();
     float humidity = dht.readHumidity();
-
     // Check if any reads failed and exit early (to try again).
     if (isnan(humidity) || isnan(temp)) {
         Serial.println("Failed to read from DHT sensor!");
@@ -109,14 +122,21 @@ void loop() {
         // esp_sleep_enable_timer_wakeup(sleepInterval);
         // esp_deep_sleep_start();
     }
-    // notify changed value
+
+    
+    // notify changed value for 1 min
     if (deviceConnected) {
-        pCharacteristic_temp->setValue(temp);
-        pCharacteristic_temp->notify();
-        pCharacteristic_humidity->setValue(humidity);
-        pCharacteristic_humidity->notify();
-        delay(1000);
+      Serial.println("notify!");
+      // notify data
+      pCharacteristic_temp->setValue(temp);
+      pCharacteristic_temp->notify();
+      pCharacteristic_humidity->setValue(humidity);
+      pCharacteristic_humidity->notify();
+      
     }
+    // counting seconds for awake time timer
+    delay(1000); 
+    counter++;
     // disconnecting
     if (!deviceConnected && oldDeviceConnected) {
         delay(500); // give the bluetooth stack the chance to get things ready
