@@ -1,17 +1,17 @@
+#include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include <DHT.h>
 
-BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic_temp = NULL;
-BLEDescriptor *pDescr_temp;
-BLE2902 *pBLE2902_temp;
 
-BLECharacteristic* pCharacteristic_humidity = NULL;
-BLEDescriptor *pDescr_humidity;
-BLE2902 *pBLE2902_humidity;
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+BLEDescriptor *pDescr;
+BLE2902 *pBLE2902;
+
+
 
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
@@ -26,8 +26,7 @@ DHT dht(DHTPIN, DHTTYPE);
 // https://www.uuidgenerator.net/
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define TEMP_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define HUMIDITY_CHARACTERISTIC_UUID "aeb5483e-36e1-4688-b7f5-ea07361b26a9"
+#define DATA_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 
 class MyServerCallbacks: public BLEServerCallbacks {
@@ -56,36 +55,22 @@ void setup() {
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
   // Create a BLE Characteristic
-  pCharacteristic_temp = pService->createCharacteristic(
-                      TEMP_CHARACTERISTIC_UUID,
+  pCharacteristic = pService->createCharacteristic(
+                      DATA_CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
                       
                     );                   
 
-    // Create a BLE Characteristic
-  pCharacteristic_humidity = pService->createCharacteristic(
-                      HUMIDITY_CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
-                      
-                    ); 
   // Create a BLE Descriptor
   // Add temp
-  pDescr_temp = new BLEDescriptor((uint16_t)0x2901);
-  pDescr_temp->setValue("Tempertature");
-  pCharacteristic_temp->addDescriptor(pDescr_temp);
+  pDescr = new BLEDescriptor((uint16_t)0x2901);
+  pDescr->setValue("DHT22 Sensor Data");
+  pCharacteristic->addDescriptor(pDescr);
 
-  pBLE2902_temp = new BLE2902();
-  pBLE2902_temp->setNotifications(true);
-  pCharacteristic_temp->addDescriptor(pBLE2902_temp);
+  pBLE2902 = new BLE2902();
+  pBLE2902->setNotifications(true);
+  pCharacteristic->addDescriptor(pBLE2902);
 
-  // Add humidity
-  pDescr_humidity = new BLEDescriptor((uint16_t)0x2901);
-  pDescr_humidity->setValue("Humidity");
-  pCharacteristic_humidity->addDescriptor(pDescr_humidity);
-
-  pBLE2902_humidity = new BLE2902();
-  pBLE2902_humidity->setNotifications(true);
-  pCharacteristic_humidity->addDescriptor(pBLE2902_humidity); 
 
 
   // Start the service
@@ -102,41 +87,42 @@ void setup() {
 
 void loop() {
 
-  Serial.print("awake: ");
-  Serial.println(counter);
+    Serial.print("awake: ");
+    Serial.println(counter);
 
-  if(counter == 20){ // if esp has been awake for 20s then it should sleep
-    counter = 0;
-    Serial.println("going to sleep now");
-    delay(1000);
-    esp_deep_sleep_start();
-  }
+    // if esp has been awake for 20s then it should sleep
+    if(counter == 60){ 
+      counter = 0;
+      Serial.println("going to sleep now");
+      delay(1000);
+      esp_deep_sleep_start();
+    }
 
     // read data from the DHT sensor
     float temp = dht.readTemperature();
     float humidity = dht.readHumidity();
-    // Check if any reads failed and exit early (to try again).
-    if (isnan(humidity) || isnan(temp)) {
-        Serial.println("Failed to read from DHT sensor!");
-        // Go to deep sleep again
-        // esp_sleep_enable_timer_wakeup(sleepInterval);
-        // esp_deep_sleep_start();
-    }
 
-    
-    // notify changed value for 1 min
-    if (deviceConnected) {
-      Serial.println("notify!");
-      // notify data
-      pCharacteristic_temp->setValue(temp);
-      pCharacteristic_temp->notify();
-      pCharacteristic_humidity->setValue(humidity);
-      pCharacteristic_humidity->notify();
-      
+    if (isnan(humidity) || isnan(temp)) {
+            Serial.println("Failed to read from DHT sensor!");
+        } else {
+            // Prepare JSON data
+            StaticJsonDocument<200> jsonDoc;
+            jsonDoc["timestamp"] = "2023-10-18T02:45:00Z"; // Replace with actual timestamp
+            jsonDoc["temp"] = temp;
+            jsonDoc["humidity"] = humidity;
+            char jsonString[200];
+            serializeJson(jsonDoc, jsonString);
+
+            // Notify connected clients
+            if (deviceConnected) {
+                pCharacteristic->setValue(jsonString);
+                pCharacteristic->notify();
+            }
     }
     // counting seconds for awake time timer
     delay(1000); 
     counter++;
+
     // disconnecting
     if (!deviceConnected && oldDeviceConnected) {
         delay(500); // give the bluetooth stack the chance to get things ready
