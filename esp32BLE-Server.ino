@@ -9,6 +9,7 @@
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pResponseCharacteristic = NULL;
 BLEDescriptor *pDescr;
 BLE2902 *pBLE2902;
 
@@ -37,6 +38,7 @@ DHT dht(DHTPIN, DHTTYPE);
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define DATA_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define RESPONSE_CHARACTERISTIC_UUID "aeb5483e-36e1-4688-b7f5-ea07361b26a9"
 
 
 
@@ -47,6 +49,18 @@ class MyServerCallbacks: public BLEServerCallbacks {
 
     void onDisconnect(BLEServer* pServer) {
       deviceConnected = false;
+    }
+};
+
+class MyResponseCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic* pCharacteristic) override {
+        std::string value = pCharacteristic->getValue();
+        if (value.length() > 0) {
+            // Process the response here
+            // Take action based on the response
+            Serial.print("respose value from client = ");
+            Serial.println(value.c_str());
+        }
     }
 };
 
@@ -68,6 +82,7 @@ String formatJson(float temp, float humidity) {
   // TODO: read any data from SD card and add to the json string
   // Prepare JSON data
   StaticJsonDocument<200> jsonDoc;
+  //TODO: implement read current time from RTC
   jsonDoc["timestamp"] = "2023-10-18T02:45:00Z"; // Replace with actual timestamp
   jsonDoc["temp"] = temp;
   jsonDoc["humidity"] = humidity;
@@ -126,7 +141,14 @@ void setup() {
                       DATA_CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
                       
-                    );                   
+                    );   
+
+  // Response Characteristic
+  pResponseCharacteristic = pService->createCharacteristic(
+                        RESPONSE_CHARACTERISTIC_UUID,
+                        BLECharacteristic::PROPERTY_WRITE
+                    );
+  pResponseCharacteristic->setCallbacks(new MyResponseCallbacks());                
 
   // Create a BLE Descriptor
   // Add temp
