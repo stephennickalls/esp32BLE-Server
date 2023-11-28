@@ -19,15 +19,13 @@ bool oldDeviceConnected = false;
 
 // timer, wake, and data transmission variables
 bool transmitData = false;
-int awakeTimeCounter = 0;
-const unsigned long AWAKETIME = 30;  // this will represent seconds;
+// int advertisingTimeCounter = 0;
+// const unsigned long MAXADVERTISINGTIME = 30;  // this will represent seconds;
 
 // EEPROM variables
 int currentCycleNumber;
 const int maxCycleNumber = 3;  // 0 index so == 4
 const int addr = 0; // memory address
-
-
 
 
 #define DHTPIN 4  
@@ -66,6 +64,40 @@ void setEEPROM() {
   }
 }
 
+String formatJson(float temp, float humidity) {
+  // TODO: read any data from SD card and add to the json string
+  // Prepare JSON data
+  StaticJsonDocument<200> jsonDoc;
+  jsonDoc["timestamp"] = "2023-10-18T02:45:00Z"; // Replace with actual timestamp
+  jsonDoc["temp"] = temp;
+  jsonDoc["humidity"] = humidity;
+
+  char jsonString[200];
+  serializeJson(jsonDoc, jsonString);
+  return String(jsonString);
+
+}
+
+void advertiseDataTransmission(String jsonString){
+  int advertisingTimeCounter = 0;
+  const int MAXADVERTISINGTIME = 30;  // this will represent seconds;
+  while (advertisingTimeCounter <= MAXADVERTISINGTIME){
+      Serial.print("advertisingTimeCounter:");
+      Serial.println(advertisingTimeCounter);
+      while (deviceConnected && (advertisingTimeCounter <= MAXADVERTISINGTIME)) {
+        pCharacteristic->setValue(jsonString.c_str());
+        pCharacteristic->notify();
+        Serial.print("Notify time passed (sec): ");
+        Serial.println(advertisingTimeCounter);
+        delay(1000); 
+        advertisingTimeCounter++;
+      }
+      // counting seconds for awake time timer
+      Serial.println("waiting for hub to connect");
+      delay(1000); 
+      advertisingTimeCounter++;
+    }
+}
 
 
 void setup() {
@@ -138,48 +170,24 @@ void loop() {
     // read data from the DHT sensor
     float temp = dht.readTemperature();
     float humidity = dht.readHumidity();
+    
     if (isnan(humidity) || isnan(temp)) {
           Serial.println("Failed to read from DHT sensor!");
           // TODO: what happens here?
       } else {
           // TODO Read any data from SD card and add to the transmission
           // Prepare JSON data
-          StaticJsonDocument<200> jsonDoc;
-          jsonDoc["timestamp"] = "2023-10-18T02:45:00Z"; // Replace with actual timestamp
-          jsonDoc["temp"] = temp;
-          jsonDoc["humidity"] = humidity;
-          char jsonString[200];
-          serializeJson(jsonDoc, jsonString);
+          String jsonString = formatJson(temp, humidity);
           // Notify to connected clients
           if (transmitData) {
-            Serial.println("transmitData was true");
               // Start the ble service
             delay(500); // give the bluetooth stack the chance to get things ready
             pServer->startAdvertising(); // restart advertising
-            Serial.println("start advertising");
-            Serial.print("awakeTimeCounter: ");
-            Serial.println(awakeTimeCounter);
-            Serial.print("AWAKETIME: ");
-            Serial.println(AWAKETIME);
-            while (awakeTimeCounter <= AWAKETIME){
-              Serial.print("awakeTimeCounter:");
-              Serial.println(awakeTimeCounter);
-              while (deviceConnected && (awakeTimeCounter <= AWAKETIME)) {
-                pCharacteristic->setValue(jsonString);
-                pCharacteristic->notify();
-                Serial.print("Notify time passed (sec): ");
-                Serial.println(awakeTimeCounter);
-                delay(1000); 
-                awakeTimeCounter++;
-              }
-              // counting seconds for awake time timer
-              Serial.println("waiting for hub to connect");
-              delay(1000); 
-              awakeTimeCounter++;
-              
-            }
+            Serial.println("BLE advertising started");
+            // advertise the data to be sent;
+            advertiseDataTransmission(jsonString);
             // TODO: if success here then delete data and go back to sleep, maybe sync timer
-            Serial.println("delete data from SD card here");
+            Serial.println("Log or remove old data from SD card here");
             currentCycleNumber = 0;  
             // write awake cule number to EEPROM
             EEPROM.put(addr, currentCycleNumber);
@@ -195,7 +203,6 @@ void loop() {
             esp_deep_sleep_start(); 
           }
         }
-      Serial.println("skipped all the ifs and went right to the next cycle grrrr");
       currentCycleNumber  = (currentCycleNumber + 1) % (maxCycleNumber + 1); // increment the number of awake cycles we have had and set to 0 if more than 3 
       EEPROM.put(addr, currentCycleNumber );
       EEPROM.commit();
