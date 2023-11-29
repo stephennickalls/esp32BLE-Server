@@ -55,11 +55,22 @@ class MyServerCallbacks: public BLEServerCallbacks {
 class MyResponseCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* pCharacteristic) override {
         std::string value = pCharacteristic->getValue();
-        if (value.length() > 0) {
+        Serial.print("The response value is: ");
+        Serial.println(value.c_str());
+        if (strcmp(value.c_str(), "success") == 0)  {
             // Process the response here
             // Take action based on the response
-            Serial.print("respose value from client = ");
-            Serial.println(value.c_str());
+            Serial.println("Going to sleep");
+            // TODO: if success here then delete data and go back to sleep, maybe sync timer
+            Serial.println("Data transmission was successful. Log or remove old data from SD card here");
+            Serial.println("Setting currentCycle to 0 and going to sleep");
+            currentCycleNumber = 0; 
+            EEPROM.put(addr, currentCycleNumber);
+            EEPROM.commit();
+            esp_deep_sleep_start(); 
+        }else {
+          Serial.println("Error: Data transmission was unsuccessful");
+          // TODO: take some other action when data transmission fails like log to sd card
         }
     }
 };
@@ -208,13 +219,6 @@ void loop() {
             Serial.println("BLE advertising started");
             // advertise the data to be sent;
             advertiseDataTransmission(jsonString);
-            // TODO: if success here then delete data and go back to sleep, maybe sync timer
-            Serial.println("Log or remove old data from SD card here");
-            currentCycleNumber = 0;  
-            // write awake cule number to EEPROM
-            EEPROM.put(addr, currentCycleNumber);
-            EEPROM.commit();
-            esp_deep_sleep_start(); 
 
           } else {
             currentCycleNumber = (currentCycleNumber + 1) % (maxCycleNumber + 1); // increment the number of awake cycles we have had and set to 0 if more than 3 
