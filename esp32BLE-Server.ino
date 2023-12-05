@@ -1,18 +1,13 @@
 #include <ArduinoJson.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <DHT.h>
 #include <EEPROM.h>
 
-
-BLEServer* pServer = NULL;
-BLECharacteristic* pCharacteristic = NULL;
-BLECharacteristic* pResponseCharacteristic = NULL;
+NimBLEServer* pServer = nullptr;
+NimBLECharacteristic* pCharacteristic = nullptr;
+NimBLECharacteristic* pResponseCharacteristic = nullptr;
 BLEDescriptor *pDescr;
-BLE2902 *pBLE2902;
-
+// NimBLE2902 *pBLE2902;
 
 // connection variables
 bool deviceConnected = false;
@@ -25,7 +20,7 @@ bool transmitData = false;
 
 // EEPROM variables
 int currentCycleNumber;
-const int maxCycleNumber = 3;  // 0 index so == 4
+const int maxCycleNumber = 4;  // 0 index so == 4
 const int addr = 0; // memory address
 
 
@@ -42,12 +37,12 @@ DHT dht(DHTPIN, DHTTYPE);
 
 
 
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) {
+class MyServerCallbacks: public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer) override {
       deviceConnected = true;
     };
 
-    void onDisconnect(BLEServer* pServer) {
+    void onDisconnect(NimBLEServer* pServer) override {
       deviceConnected = false;
     }
 };
@@ -105,8 +100,9 @@ String formatJson(float temp, float humidity) {
 }
 
 void advertiseDataTransmission(String jsonString){
+  Serial.println("advertiseDataTransmission called");
   int advertisingTimeCounter = 0;
-  const int MAXADVERTISINGTIME = 30;  // this will represent seconds;
+  const int MAXADVERTISINGTIME = 15;  // this will represent seconds;
   while (advertisingTimeCounter <= MAXADVERTISINGTIME){
       Serial.print("advertisingTimeCounter:");
       Serial.println(advertisingTimeCounter);
@@ -123,6 +119,7 @@ void advertiseDataTransmission(String jsonString){
       delay(1000); 
       advertisingTimeCounter++;
     }
+    transmitData = false;
 }
 
 
@@ -137,55 +134,46 @@ void setup() {
   // initialize EEPROM
   setEEPROM();
 
-      // Create the BLE Device
-  BLEDevice::init("ESP32");
+  // Initialize NimBLE
+  NimBLEDevice::init("ESP32");
 
   // Create the BLE Server
-  pServer = BLEDevice::createServer();
+  pServer = NimBLEDevice::createServer();
   pServer->setCallbacks(new MyServerCallbacks());
 
   // Create the BLE Service
-  BLEService *pService = pServer->createService(SERVICE_UUID);
+  NimBLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Create a BLE Characteristic
+  // Create a BLE Characteristic for data
   pCharacteristic = pService->createCharacteristic(
                       DATA_CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
-                      
-                    );   
+                      NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
+                    );
 
   // Response Characteristic
   pResponseCharacteristic = pService->createCharacteristic(
                         RESPONSE_CHARACTERISTIC_UUID,
-                        BLECharacteristic::PROPERTY_WRITE
+                        NIMBLE_PROPERTY::WRITE
                     );
-  pResponseCharacteristic->setCallbacks(new MyResponseCallbacks());                
+  pResponseCharacteristic->setCallbacks(new MyResponseCallbacks());
 
-  // Create a BLE Descriptor
-  // Add temp
-  pDescr = new BLEDescriptor((uint16_t)0x2901);
+  // Create a BLE Descriptor for DHT22 sensor data
+  NimBLEDescriptor* pDescr = new NimBLEDescriptor("2901", NIMBLE_PROPERTY::READ, 0, pCharacteristic);
   pDescr->setValue("DHT22 Sensor Data");
   pCharacteristic->addDescriptor(pDescr);
 
-  pBLE2902 = new BLE2902();
-  pBLE2902->setNotifications(true);
-  pCharacteristic->addDescriptor(pBLE2902);
+  pService->start();
 
-
-pService->start();
-
-// Start advertising
-BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-pAdvertising->addServiceUUID(SERVICE_UUID);
-pAdvertising->setScanResponse(false);
-pAdvertising->setMinPreferred(0x0);  // set value to 0x00 to not advertise this parameter
-BLEDevice::startAdvertising();
-Serial.println("BLE service started");
+  // Start advertising
+  NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
 
 } // end setup
 
 
 void loop() {
+    
     // read cycle number from EEPROM
     EEPROM.get(addr, currentCycleNumber);
 
