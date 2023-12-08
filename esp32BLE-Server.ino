@@ -23,6 +23,8 @@ int currentCycleNumber;
 const int maxCycleNumber = 3;  
 const int addr = 0; // memory address
 
+
+
 enum class programState: uint8_t {
   READ_SAVE_SLEEP,
   ADVERTISE_DATA_SLEEP
@@ -39,6 +41,8 @@ const char* programStateToString(programState state) {
 
 static NimBLEServer* pServer;
 NimBLEAdvertising* pAdvertising = nullptr;
+
+NimBLECharacteristic* pDHTCharacteristic;  // Global declaration
 
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define DATA_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
@@ -81,16 +85,10 @@ class ServerCallbacks: public NimBLEServerCallbacks {
 };
 
 /** Handler class for characteristic actions */
-class CharacteristicCallbacks: public NimBLECharacteristicCallbacks {
+class DHTCallbacks: public NimBLECharacteristicCallbacks {
     void onRead(NimBLECharacteristic* pCharacteristic){
         debug(pCharacteristic->getUUID().toString().c_str());
         debug(": onRead(), value: ");
-        debugln(pCharacteristic->getValue().c_str());
-    };
-
-    void onWrite(NimBLECharacteristic* pCharacteristic) {
-        debug(pCharacteristic->getUUID().toString().c_str());
-        debug(": onWrite(), value: ");
         debugln(pCharacteristic->getValue().c_str());
     };
     /** Called before notification or indication is sent,
@@ -98,20 +96,6 @@ class CharacteristicCallbacks: public NimBLECharacteristicCallbacks {
      */
     void onNotify(NimBLECharacteristic* pCharacteristic) {
         debugln("Sending notification to clients");
-    };
-
-
-    /** The status returned in status is defined in NimBLECharacteristic.h.
-     *  The value returned in code is the NimBLE host return code.
-     */
-    void onStatus(NimBLECharacteristic* pCharacteristic, Status status, int code) {
-        String str = ("Notification/Indication status code: ");
-        str += status;
-        str += ", return code: ";
-        str += code;
-        str += ", ";
-        str += NimBLEUtils::returnCodeToString(code);
-        debugln(str);
     };
 
     void onSubscribe(NimBLECharacteristic* pCharacteristic, ble_gap_conn_desc* desc, uint16_t subValue) {
@@ -134,6 +118,16 @@ class CharacteristicCallbacks: public NimBLECharacteristicCallbacks {
     };
 };
 
+/** Handler class for characteristic actions */
+class ResponseCallbacks: public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic* pCharacteristic) {
+        debug(pCharacteristic->getUUID().toString().c_str());
+        debug(": onWrite(), value: ");
+        debugln(pCharacteristic->getValue().c_str());
+    };
+
+};
+
 /** Handler class for descriptor actions */
 class DescriptorCallbacks : public NimBLEDescriptorCallbacks {
 
@@ -145,8 +139,9 @@ class DescriptorCallbacks : public NimBLEDescriptorCallbacks {
 
 
 /** Define callback instances globally to use for multiple Charateristics \ Descriptors */
-static DescriptorCallbacks dscCallbacks;
-static CharacteristicCallbacks chrCallbacks;
+static DescriptorCallbacks dscriptionCallbacks;
+static DHTCallbacks DHTCallbacks;
+static ResponseCallbacks responseCallbacks;
 
 
 //################### setup ############################
@@ -180,12 +175,12 @@ void setup() {
 
   NimBLEService* pDHTService = pServer->createService(SERVICE_UUID);
 
-  NimBLECharacteristic* pDHTCharacteristic = pDHTService->createCharacteristic(
+ pDHTCharacteristic = pDHTService->createCharacteristic(
                                               DATA_CHARACTERISTIC_UUID,
                                               NIMBLE_PROPERTY::READ |
                                               NIMBLE_PROPERTY::NOTIFY
                                             );
-  pDHTCharacteristic->setCallbacks(&chrCallbacks);
+  pDHTCharacteristic->setCallbacks(&DHTCallbacks);
 
   /** Custom descriptor: Arguments are UUID, Properties, max length in bytes of the value */
   NimBLEDescriptor* pDHTSensorDescriptor = pDHTCharacteristic->createDescriptor(
@@ -194,7 +189,7 @@ void setup() {
                                               50
                                             );
   pDHTSensorDescriptor->setValue("DHT22 temp and humidity readings");
-  pDHTSensorDescriptor->setCallbacks(&dscCallbacks);
+  pDHTSensorDescriptor->setCallbacks(&dscriptionCallbacks);
 
   NimBLECharacteristic* pDHTResponseCharacteristic = pDHTService->createCharacteristic(
                                           RESPONSE_CHARACTERISTIC_UUID,
@@ -203,7 +198,7 @@ void setup() {
                                         );
 
   pDHTResponseCharacteristic->setValue("Test value from response characteristic");
-  pDHTResponseCharacteristic->setCallbacks(&chrCallbacks);
+  pDHTResponseCharacteristic->setCallbacks(&responseCallbacks);
 
   /** Start the services when finished creating all Characteristics and Descriptors */
   pDHTService->start();
@@ -233,7 +228,7 @@ void programStateMachine(){
   EEPROM.get(addr, currentCycleNumber);
 
   static unsigned long timer = millis();
-  static unsigned long MAXADVERTISINGTIME = 10000;
+  static unsigned long MAXADVERTISINGTIME = 1*10000;
 
   float temp;
   float humidity;
@@ -244,6 +239,7 @@ void programStateMachine(){
   switch (currentState) {
     // ################# CASE READ_SAVE_SLEEP ##################
     case programState::READ_SAVE_SLEEP:
+    delay(1000);
       debug("currentCycleNumber = ");
       debugln(String(currentCycleNumber));
       // print state
@@ -260,6 +256,7 @@ void programStateMachine(){
         humidity = dht.readHumidity();
 
         if (isnan(temp) || isnan(humidity)){
+          // TODO: do something here on read fail
           debugln("Failed to read DHT sensor");
           break;
         };
@@ -267,18 +264,20 @@ void programStateMachine(){
         String jsonString = formatJson(temp, humidity);
         // TODO: save data then sleep untill next cycle
         debugln("Saving data to SD card here");
-        delay(2000);
         currentCycleNumber++;
         EEPROM.put(addr, currentCycleNumber);
         EEPROM.commit();
         // set deep sleep timer  
         debugln("Going to sleep");
-        esp_sleep_enable_timer_wakeup(1 * 10 * 1000000);
+        esp_sleep_enable_timer_wakeup(1 * 10 * 1000000); 
         esp_deep_sleep_start();
       };
       break;
+
     // ################# ADVERTISE_DATA_SLEEP ##################
     case programState::ADVERTISE_DATA_SLEEP:
+    delay(1000);
+      static bool getDataAndAdvertise = false; // Static flag
       debug("currentCycleNumber = ");
       debugln(String(currentCycleNumber));  
 
@@ -289,41 +288,39 @@ void programStateMachine(){
       debug("millis = ");
       debugln(String(millis()));
 
-
-      if (millis() - timer >= MAXADVERTISINGTIME){
+      // advertises for 1 minute then sleeps for 1 minute to maintain the 2 mins for each proccess 1 full proccess = 4 cycles (this version has 2 min cycles for a full process of 8 mins)
+      if (millis() - timer >= MAXADVERTISINGTIME){ 
+        getDataAndAdvertise = false; // Reset the flag
         currentCycleNumber = 0;
         EEPROM.put(addr, currentCycleNumber);
         EEPROM.commit();
         debugln("Going to sleep");
         // set deep sleep timer  
-        esp_sleep_enable_timer_wakeup(3 * 10 * 1000000);
+        esp_sleep_enable_timer_wakeup(1 * 10 * 1000000); // 1 minute
         esp_deep_sleep_start();
       };
-      debug("program state ADVERTISE_DATA_SLEEP called ");
+      // debug("program state ADVERTISE_DATA_SLEEP called ");
 
-      // read sensor
-      temp = dht.readTemperature();
-      humidity = dht.readHumidity();
+      // If this flag is false then get the data and start the BLE
+      // if it is true then we already have the data and started advertising in this cycle
+      if (!getDataAndAdvertise) {
+          pAdvertising->start();
+          debugln("Advertising....");
 
-      if (isnan(temp) || isnan(humidity)){
-        debugln("Failed to read DHT sensor");
-        break;
-      };
-      pAdvertising->start();
-      debugln("Advertising....");
-      delay(2000);
-
-      if(pServer->getConnectedCount()) {
-        NimBLEService* pSvc = pServer->getServiceByUUID(SERVICE_UUID);
-        if(pSvc) {
-            NimBLECharacteristic* pChr = pSvc->getCharacteristic(DATA_CHARACTERISTIC_UUID);
-            if(pChr) {
-                pChr->setValue(String(temp));
-                pChr->notify(true);
-            }
-        }
-    }
-
+          getDataAndAdvertise = true; // Set the flag
+          // TODO: get data from SD card
+          // get sensor data from sensor
+          temp = dht.readTemperature();
+          humidity = dht.readHumidity();
+          if (isnan(temp) || isnan(humidity)) {
+            // TODO: do somethin if fail
+              debugln("Failed to read DHT sensor");
+              break;
+          }
+          // TODO: add this read to SD card data
+          // start the BLE advertising
+          pDHTCharacteristic->setValue(String(temp));
+      }
     break;
 
   default:
