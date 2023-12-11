@@ -2,7 +2,13 @@
 #include <ArduinoJson.h>
 #include <DHT.h>
 #include <EEPROM.h>
+#include <ESP32Time.h>
 #include <NimBLEDevice.h>
+#include <SPI.h>
+#include <SD.h>
+
+File dataFile;
+const int CS = 5; // Chip Select pin for SD card comms
 
 #define DHTPIN 4  
 #define DHTTYPE DHT22
@@ -18,6 +24,11 @@ DHT dht(DHTPIN, DHTTYPE);
 #define debugln(x)
 #endif
 
+
+
+//ESP32Time rtc;
+ESP32Time rtc(3600);
+
 // EEPROM variables
 int currentCycleNumber;
 const int maxCycleNumber = 3;  
@@ -26,9 +37,11 @@ const int addr = 0; // memory address
 
 
 enum class programState: uint8_t {
+  TIME_CONFIG,
   READ_SAVE_SLEEP,
   ADVERTISE_DATA_SLEEP
 };
+
 
 // Function to convert programState to string
 const char* programStateToString(programState state) {
@@ -147,10 +160,20 @@ static ResponseCallbacks responseCallbacks;
 //################### setup ############################
 void setup() {
   Serial.begin(115200);
+  // TODO: implement set time on power up
+  rtc.setTime(30, 24, 15, 17, 1, 2021);  // 17th Jan 2021 15:24:30
   EEPROM.begin(512);
   // initialize EEPROM   
   setEEPROM();
   dht.begin();
+
+  while (!Serial) { ; }  // wait for serial port to connect. Needed for native USB port only
+  debugln("Initializing SD card...");
+  if (!SD.begin(CS)) {
+    debugln("initialization failed!");
+    return;
+  }
+  Serial.println("initialization done.");
 
   // set deep sleep timer  
   // esp_sleep_enable_timer_wakeup(1 * 10 * 1000000);
@@ -217,7 +240,11 @@ void setup() {
 
 //################### LOOP Nothing much in here, just calls state machine ############################
 void loop() {
+    debug("################ wakeup reason: ");
+    debugln(esp_sleep_get_wakeup_cause());
     programStateMachine();
+    ReadFile("/data.txt");
+    
 } // end loop
 
 
@@ -229,9 +256,6 @@ void programStateMachine(){
 
   static unsigned long timer = millis();
   static unsigned long MAXADVERTISINGTIME = 1*10000;
-
-  float temp;
-  float humidity;
 
   // track current state
   static programState currentState = programState::READ_SAVE_SLEEP;
@@ -251,19 +275,10 @@ void programStateMachine(){
           timer = millis();
           break;
       }else{
-        // read sensor
-        temp = dht.readTemperature();
-        humidity = dht.readHumidity();
+        
+        String data = getDataReading();
+        WriteFile("/data.txt", data);
 
-        if (isnan(temp) || isnan(humidity)){
-          // TODO: do something here on read fail
-          debugln("Failed to read DHT sensor");
-          break;
-        };
-
-        String jsonString = formatJson(temp, humidity);
-        // TODO: save data then sleep untill next cycle
-        debugln("Saving data to SD card here");
         currentCycleNumber++;
         EEPROM.put(addr, currentCycleNumber);
         EEPROM.commit();
@@ -310,16 +325,12 @@ void programStateMachine(){
           getDataAndAdvertise = true; // Set the flag
           // TODO: get data from SD card
           // get sensor data from sensor
-          temp = dht.readTemperature();
-          humidity = dht.readHumidity();
-          if (isnan(temp) || isnan(humidity)) {
-            // TODO: do somethin if fail
-              debugln("Failed to read DHT sensor");
-              break;
-          }
+          String data = getDataReading();
           // TODO: add this read to SD card data
           // start the BLE advertising
-          pDHTCharacteristic->setValue(String(temp));
+          pDHTCharacteristic->setValue(data);
+          debug("Characteristic value: ");
+          debugln(pDHTCharacteristic->getValue().c_str());
       }
     break;
 
@@ -328,7 +339,74 @@ void programStateMachine(){
   }
 }
 
+
+
+
+
 // ################# Some Helpers ##################
+
+String getTimestamp(){
+  String timestamp = rtc.getTime("%Y-%m-%dT%H:%M:%SZ");
+  // Check if the timestamp is not empty or invalid
+  if (timestamp.length() > 0 && timestamp != "1970-01-01T00:00:00Z") {
+      debugln("Current time: " + timestamp);
+      return timestamp;
+  } else {
+      debugln("Error: Invalid time");
+  }
+  return "1970-01-01T00:00:00Z";
+
+}
+
+String getDataReading(){
+  // timestamp
+  String timestamp = getTimestamp();
+  // read sensor
+  float temp = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temp) || isnan(humidity)){
+    // TODO: do something here on read fail
+    debugln("Failed to read DHT sensor");
+  };
+  
+  String jsonString = formatJson(timestamp, temp, humidity);
+  return jsonString;
+
+}
+
+void WriteFile(const char * path, String data) {
+    File dataFile = SD.open(path, FILE_APPEND);
+    
+    if (dataFile) {
+        debugln("Writing to: " + String(path));
+        dataFile.println(data);
+        dataFile.close();
+        debugln("Write completed.");
+    } else {
+        debugln("Error opening file: " + String(path));
+    }
+}
+
+
+void ReadFile(const char * path){
+  // open the file for reading:
+  dataFile = SD.open(path);
+  if (dataFile) {
+     debug("Reading file from: ");
+     debugln(path);
+     // read from the file until there's nothing else in it:
+    while (dataFile.available()) {
+      Serial.write(dataFile.read());
+    }
+    dataFile.close(); // close the file:
+  } 
+  else {
+    // if the file didn't open, print an error:
+    debugln("error opening file");
+  }
+}
+
 void setEEPROM() {
   const int addr = 0;
   const int value = 0;
@@ -343,12 +421,10 @@ void setEEPROM() {
   }
 }
 
-String formatJson(float temp, float humidity) {
-  // TODO: read any data from SD card and add to the json string
+String formatJson(String timestamp, float temp, float humidity) {
   // Prepare JSON data
   StaticJsonDocument<200> jsonDoc;
-  //TODO: implement read current time from RTC
-  jsonDoc["timestamp"] = "2023-10-18T02:45:00Z"; // Replace with actual timestamp
+  jsonDoc["timestamp"] = timestamp; 
   jsonDoc["temp"] = temp;
   jsonDoc["humidity"] = humidity;
 
