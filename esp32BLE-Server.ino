@@ -4,16 +4,11 @@
 #include <EEPROM.h>
 #include <ESP32Time.h>
 #include <NimBLEDevice.h>
+#include <RTClib.h>
 #include <SPI.h>
 #include <SD.h>
 
-File dataFile;
-const int CS = 5; // Chip Select pin for SD card comms
-
-#define DHTPIN 4  
-#define DHTTYPE DHT22
-DHT dht(DHTPIN, DHTTYPE);
-
+// debug settings
 #define DEBUG 1
 
 #if DEBUG == 1
@@ -23,11 +18,19 @@ DHT dht(DHTPIN, DHTTYPE);
 #define debug(x)
 #define debugln(x)
 #endif
+// end debug settings
 
+// real time clock
+RTC_DS3231 rtc;
 
+// sd card file
+File dataFile;
+const int CS = 5; // Chip Select pin for SD card comms
 
-//ESP32Time rtc;
-ESP32Time rtc(3600);
+// defining temp and humidity sensor
+#define DHTPIN 4  
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
 
 // EEPROM variables
 int currentCycleNumber;
@@ -35,7 +38,7 @@ const int maxCycleNumber = 3;
 const int addr = 0; // memory address
 
 
-
+// statmachine enum
 enum class programState: uint8_t {
   TIME_CONFIG,
   READ_SAVE_SLEEP,
@@ -160,20 +163,42 @@ static ResponseCallbacks responseCallbacks;
 //################### setup ############################
 void setup() {
   Serial.begin(115200);
-  // TODO: implement set time on power up
-  rtc.setTime(30, 24, 15, 17, 1, 2021);  // 17th Jan 2021 15:24:30
-  EEPROM.begin(512);
-  // initialize EEPROM   
+
+  // SETUP RTC MODULE
+  if (! rtc.begin()) {
+    debugln("RTC module is NOT found");
+    Serial.flush();
+    while (1);
+  }
+  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // manually sets the RTC with an explicit date & time, for example to set
+  // January 21, 2021 at 3am you would call:
+  // rtc.adjust(DateTime(2021, 1, 21, 3, 0, 0))
+  //check if rtc lost power i.e. battery dead or removed
+    if (rtc.lostPower()) {
+    debugln("RTC lost power, let's set the time!");
+    // Set the date and time here if the RTC lost power
+    // TODO: set state for time config
+    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    // This line sets the RTC with an explicit date & time, for example:
+    // rtc.adjust(DateTime(2023, 10, 18, 2, 45, 0));
+  }
+
+  // initialize EEPROM 
+  EEPROM.begin(512); 
   setEEPROM();
+
+  // initialize dht sensor
   dht.begin();
 
-  while (!Serial) { ; }  // wait for serial port to connect. Needed for native USB port only
-  debugln("Initializing SD card...");
-  if (!SD.begin(CS)) {
-    debugln("initialization failed!");
-    return;
-  }
-  Serial.println("initialization done.");
+  // while (!Serial) { ; }  // wait for serial port to connect. Needed for native USB port only
+  // debugln("Initializing SD card...");
+  // if (!SD.begin(CS)) {
+  //   debugln("initialization failed!");
+  //   return;
+  // }
+  // Serial.println("initialization done.");
 
   // set deep sleep timer  
   // esp_sleep_enable_timer_wakeup(1 * 10 * 1000000);
@@ -243,7 +268,7 @@ void loop() {
     debug("################ wakeup reason: ");
     debugln(esp_sleep_get_wakeup_cause());
     programStateMachine();
-    ReadFile("/data.txt");
+    // ReadFile("/data.txt");
     
 } // end loop
 
@@ -276,15 +301,15 @@ void programStateMachine(){
           break;
       }else{
         
-        String data = getDataReading();
-        WriteFile("/data.txt", data);
+        // String data = getDataReading();
+        // WriteFile("/data.txt", data);
 
         currentCycleNumber++;
         EEPROM.put(addr, currentCycleNumber);
         EEPROM.commit();
         // set deep sleep timer  
         debugln("Going to sleep");
-        esp_sleep_enable_timer_wakeup(1 * 10 * 1000000); 
+        esp_sleep_enable_timer_wakeup((uint64_t)getSleepTimerLength() * 1000000);
         esp_deep_sleep_start();
       };
       break;
@@ -310,8 +335,10 @@ void programStateMachine(){
         EEPROM.put(addr, currentCycleNumber);
         EEPROM.commit();
         debugln("Going to sleep");
-        // set deep sleep timer  
-        esp_sleep_enable_timer_wakeup(1 * 10 * 1000000); // 1 minute
+        
+
+        esp_sleep_enable_timer_wakeup((uint64_t)getSleepTimerLength() * 1000000);
+
         esp_deep_sleep_start();
       };
       // debug("program state ADVERTISE_DATA_SLEEP called ");
@@ -324,11 +351,9 @@ void programStateMachine(){
 
           getDataAndAdvertise = true; // Set the flag
           // TODO: get data from SD card
-          // get sensor data from sensor
-          String data = getDataReading();
-          // TODO: add this read to SD card data
           // start the BLE advertising
-          pDHTCharacteristic->setValue(data);
+
+          // pDHTCharacteristic->setValue(data);
           debug("Characteristic value: ");
           debugln(pDHTCharacteristic->getValue().c_str());
       }
@@ -345,8 +370,37 @@ void programStateMachine(){
 
 // ################# Some Helpers ##################
 
+int getSleepTimerLength() {
+    DateTime now = rtc.now(); // Replace with your method of getting current time
+
+    int currentMinutes = now.minute();
+    int currentSeconds = now.second();
+
+    // Calculate the time to the next wake-up increment (every 2 minutes on even minutes)
+    int toNextWakeupIncrement = (currentMinutes % 2 == 0 && currentSeconds == 0) ? 0 : 2 - (currentMinutes % 2);
+
+    // Convert this to seconds and subtract the current seconds to get total time to sleep
+    int totalSecondsToNextWakeup = (toNextWakeupIncrement * 60) - currentSeconds;
+
+    // Ensure the total time is not negative
+    totalSecondsToNextWakeup = max(totalSecondsToNextWakeup, 0);
+
+    return totalSecondsToNextWakeup;
+}
+
+
+
+
+String formatDateTime(const DateTime& dt) {
+  char buffer[20];
+  snprintf(buffer, sizeof(buffer), "%04d-%02d-%02dT%02d:%02d:%02dZ", 
+           dt.year(), dt.month(), dt.day(), dt.hour(), dt.minute(), dt.second());
+  return String(buffer);
+}
+
 String getTimestamp(){
-  String timestamp = rtc.getTime("%Y-%m-%dT%H:%M:%SZ");
+  DateTime now = rtc.now();
+  String timestamp = formatDateTime(now);
   // Check if the timestamp is not empty or invalid
   if (timestamp.length() > 0 && timestamp != "1970-01-01T00:00:00Z") {
       debugln("Current time: " + timestamp);
