@@ -1,7 +1,7 @@
 
 #include <ArduinoJson.h>
 #include <DHT.h>
-#include <EEPROM.h>
+// #include <EEPROM.h>
 #include <ESP32Time.h>
 #include <NimBLEDevice.h>
 #include <RTClib.h>
@@ -23,9 +23,14 @@
 // real time clock
 RTC_DS3231 rtc;
 
+int timeslot_offset = 0; // Offset in minutes
+const int cycleDuration = 2; // Duration of each cycle in minutes should be 15min, set to 1 for testing
+esp_sleep_wakeup_cause_t wakeup_reason; // what cause the wake up of this device
+
 // sd card file
 File dataFile;
 const int CS = 5; // Chip Select pin for SD card comms
+bool sdCardInitialized = false;
 
 // defining temp and humidity sensor
 #define DHTPIN 4  
@@ -36,6 +41,10 @@ DHT dht(DHTPIN, DHTTYPE);
 int currentCycleNumber;
 const int maxCycleNumber = 3;  
 const int addr = 0; // memory address
+
+bool dataTransmissionSuccess = false;
+
+
 
 
 // statmachine enum
@@ -71,6 +80,7 @@ NimBLECharacteristic* pDHTCharacteristic;  // Global declaration
 /**  None of these are required as they will be handled by the library with defaults. **
  **                       Remove as you see fit for your needs                        */
 class ServerCallbacks: public NimBLEServerCallbacks {
+
     void onConnect(NimBLEServer* pServer) {
         debugln("Client connected");
         debugln("Multi-connect support: start advertising");
@@ -96,13 +106,18 @@ class ServerCallbacks: public NimBLEServerCallbacks {
         NimBLEDevice::startAdvertising();
     };
     void onMTUChange(uint16_t MTU, ble_gap_conn_desc* desc) {
-        // debugf("MTU updated: %u for connection ID: %u\n", MTU, desc->conn_handle);
+        Serial.printf("MTU updated: %u for connection ID: %u\n", MTU, desc->conn_handle);
     };
+
+
 };
 
 /** Handler class for characteristic actions */
 class DHTCallbacks: public NimBLECharacteristicCallbacks {
     void onRead(NimBLECharacteristic* pCharacteristic){
+      debugln("############ onRead called, client read data");
+      // TODO: logic around success or fail
+      dataTransmissionSuccess = true;
         debug(pCharacteristic->getUUID().toString().c_str());
         debug(": onRead(), value: ");
         debugln(pCharacteristic->getValue().c_str());
@@ -137,6 +152,9 @@ class DHTCallbacks: public NimBLECharacteristicCallbacks {
 /** Handler class for characteristic actions */
 class ResponseCallbacks: public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pCharacteristic) {
+      debugln("############ onWrite called, response from client recived");
+      // TODO: logic around success or fail
+      dataTransmissionSuccess = true;
         debug(pCharacteristic->getUUID().toString().c_str());
         debug(": onWrite(), value: ");
         debugln(pCharacteristic->getValue().c_str());
@@ -159,10 +177,11 @@ static DescriptorCallbacks dscriptionCallbacks;
 static DHTCallbacks DHTCallbacks;
 static ResponseCallbacks responseCallbacks;
 
-
 //################### setup ############################
 void setup() {
   Serial.begin(115200);
+
+  wakeup_reason = esp_sleep_get_wakeup_cause();
 
   // SETUP RTC MODULE
   if (! rtc.begin()) {
@@ -170,38 +189,26 @@ void setup() {
     Serial.flush();
     while (1);
   }
-  rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
 
-  // manually sets the RTC with an explicit date & time, for example to set
-  // January 21, 2021 at 3am you would call:
-  // rtc.adjust(DateTime(2021, 1, 21, 3, 0, 0))
-  //check if rtc lost power i.e. battery dead or removed
-    if (rtc.lostPower()) {
-    debugln("RTC lost power, let's set the time!");
-    // Set the date and time here if the RTC lost power
-    // TODO: set state for time config
-    rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
-    // This line sets the RTC with an explicit date & time, for example:
-    // rtc.adjust(DateTime(2023, 10, 18, 2, 45, 0));
-  }
-
-  // initialize EEPROM 
-  EEPROM.begin(512); 
-  setEEPROM();
+  // // initialize EEPROM 
+  // EEPROM.begin(512); 
+  // setEEPROM();
 
   // initialize dht sensor
   dht.begin();
 
-  // while (!Serial) { ; }  // wait for serial port to connect. Needed for native USB port only
-  // debugln("Initializing SD card...");
-  // if (!SD.begin(CS)) {
-  //   debugln("initialization failed!");
-  //   return;
-  // }
-  // Serial.println("initialization done.");
+  debugln("Initializing SD card...");
 
-  // set deep sleep timer  
-  // esp_sleep_enable_timer_wakeup(1 * 10 * 1000000);
+  while (!Serial) {;}
+
+  if (!SD.begin(CS)) {
+      debugln("SD card initialization failed!");
+      sdCardInitialized = false;
+  } else {
+      debugln("SD card initialization done.");
+      sdCardInitialized = true;
+  }
+
 
   debugln("Starting NimBLE Server");
   /** sets device name */
@@ -218,7 +225,10 @@ void setup() {
   NimBLEDevice::setSecurityAuth(/*BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_MITM |*/ BLE_SM_PAIR_AUTHREQ_SC);
 
   pServer = NimBLEDevice::createServer();
+  // Request a specific MTU size
+  NimBLEDevice::setMTU(512);
   pServer->setCallbacks(new ServerCallbacks());
+
 
 
   NimBLEService* pDHTService = pServer->createService(SERVICE_UUID);
@@ -267,6 +277,8 @@ void setup() {
 void loop() {
     debug("################ wakeup reason: ");
     debugln(esp_sleep_get_wakeup_cause());
+    debug("rtc.now() = ");
+    debugln(String(rtc.now().hour()) + ":" + String(rtc.now().minute()) + "." + String(rtc.now().second()));
     programStateMachine();
     // ReadFile("/data.txt");
     
@@ -276,8 +288,21 @@ void loop() {
 //################### Finite state machine handles sensor operation, sleep and BLE comms ############################
 void programStateMachine(){
 
+   // if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
+    //     // Calculate the current cycle number only if not woken up by a timer
+    //     int calculatedCurrentCycleNumber = getCurrentCycleNumber(rtc.now());
+    //     debug("################ the calculatedCycleNumber is: ");
+    //     debugln(calculatedCurrentCycleNumber);
+    // }
+    // print the current time
+    
+    DateTime now = rtc.now();
+    int calculatedCurrentCycleNumber = getCurrentCycleNumber(now);
+        debug("################ the calculatedCycleNumber is: ");
+        debugln(calculatedCurrentCycleNumber);
+
   // read cycle number from EEPROM
-  EEPROM.get(addr, currentCycleNumber);
+  // EEPROM.get(addr, currentCycleNumber);
 
   static unsigned long timer = millis();
   static unsigned long MAXADVERTISINGTIME = 1*10000;
@@ -288,13 +313,14 @@ void programStateMachine(){
   switch (currentState) {
     // ################# CASE READ_SAVE_SLEEP ##################
     case programState::READ_SAVE_SLEEP:
+    debugln("READ_SAVE_SLEEP CALLED");
     delay(1000);
-      debug("currentCycleNumber = ");
-      debugln(String(currentCycleNumber));
+      // debug("currentCycleNumber = ");
+      // debugln(String(currentCycleNumber));
       // print state
       debugln("program state READ_SAVE_SLEEP called ");
       // condition to switch state
-      if (currentCycleNumber == maxCycleNumber){
+      if (calculatedCurrentCycleNumber == maxCycleNumber){
           currentState = programState::ADVERTISE_DATA_SLEEP;
           //set timer to current millis to be used in ADVERTISE_DATA_SLEEP state to trigger stop advertising
           timer = millis();
@@ -302,22 +328,25 @@ void programStateMachine(){
       }else{
         
         // String data = getDataReading();
-        // WriteFile("/data.txt", data);
+        // debugln(data);
+        // appendFile("/data.txt", data);
 
-        currentCycleNumber++;
-        EEPROM.put(addr, currentCycleNumber);
-        EEPROM.commit();
+        // currentCycleNumber++;
+        // currentCycleNumber = calculatedCurrentCycleNumber;
+        // EEPROM.put(addr, currentCycleNumber);
+        // EEPROM.commit();
         // set deep sleep timer  
         debugln("Going to sleep");
-        esp_sleep_enable_timer_wakeup((uint64_t)getSleepTimerLength() * 1000000);
+        esp_sleep_enable_timer_wakeup((uint64_t)calculateSleepDuration(rtc.now()) * 1000000);
         esp_deep_sleep_start();
       };
       break;
 
     // ################# ADVERTISE_DATA_SLEEP ##################
     case programState::ADVERTISE_DATA_SLEEP:
+    debugln("ADVERTISE_DATA_SLEEP");
     delay(1000);
-      static bool getDataAndAdvertise = false; // Static flag
+      static bool haveDataAndAdvertising = false; // Static flag
       debug("currentCycleNumber = ");
       debugln(String(currentCycleNumber));  
 
@@ -330,32 +359,40 @@ void programStateMachine(){
 
       // advertises for 1 minute then sleeps for 1 minute to maintain the 2 mins for each proccess 1 full proccess = 4 cycles (this version has 2 min cycles for a full process of 8 mins)
       if (millis() - timer >= MAXADVERTISINGTIME){ 
-        getDataAndAdvertise = false; // Reset the flag
-        currentCycleNumber = 0;
-        EEPROM.put(addr, currentCycleNumber);
-        EEPROM.commit();
+        debugln("Setting up to sleep");
+        haveDataAndAdvertising = false; // Reset the flag
+        // currentCycleNumber = 0;
+        // EEPROM.put(addr, currentCycleNumber);
+        // EEPROM.commit();
         debugln("Going to sleep");
-        
-
-        esp_sleep_enable_timer_wakeup((uint64_t)getSleepTimerLength() * 1000000);
-
+        // sets sleep timer to however many seconds there are untill the next quater hour (timeslot offset to be included).
+        esp_sleep_enable_timer_wakeup((uint64_t)calculateSleepDuration(rtc.now()) * 1000000); 
         esp_deep_sleep_start();
       };
-      // debug("program state ADVERTISE_DATA_SLEEP called ");
-
+      debugln("between ifs");
       // If this flag is false then get the data and start the BLE
       // if it is true then we already have the data and started advertising in this cycle
-      if (!getDataAndAdvertise) {
+      if (!haveDataAndAdvertising) {
+        debugln("about to start advertising");
           pAdvertising->start();
           debugln("Advertising....");
 
-          getDataAndAdvertise = true; // Set the flag
+          haveDataAndAdvertising = true; // Set the flag
           // TODO: get data from SD card
           // start the BLE advertising
-
-          // pDHTCharacteristic->setValue(data);
+          // String dataFromFile = readFile("/data.txt");
+          // pDHTCharacteristic->setValue(dataFromFile);
+          // debug(dataFromFile);
           debug("Characteristic value: ");
-          debugln(pDHTCharacteristic->getValue().c_str());
+          debugln(pDHTCharacteristic->getValue().c_str());  
+      }
+      debugln("just before datatransmissionsuccess if");
+
+      if(dataTransmissionSuccess){
+          clearFile("/data.txt"); 
+          dataTransmissionSuccess = false;
+          debugln("Data transfered to client. Clearing data and going to sleep");
+          timer = MAXADVERTISINGTIME + 1; // make timer larger that MAXADVERTISINGTIME so that the advertising will stop and programe will sleep
       }
     break;
 
@@ -370,26 +407,26 @@ void programStateMachine(){
 
 // ################# Some Helpers ##################
 
-int getSleepTimerLength() {
-    DateTime now = rtc.now(); // Replace with your method of getting current time
-
-    int currentMinutes = now.minute();
-    int currentSeconds = now.second();
-
-    // Calculate the time to the next wake-up increment (every 2 minutes on even minutes)
-    int toNextWakeupIncrement = (currentMinutes % 2 == 0 && currentSeconds == 0) ? 0 : 2 - (currentMinutes % 2);
-
-    // Convert this to seconds and subtract the current seconds to get total time to sleep
-    int totalSecondsToNextWakeup = (toNextWakeupIncrement * 60) - currentSeconds;
-
-    // Ensure the total time is not negative
-    totalSecondsToNextWakeup = max(totalSecondsToNextWakeup, 0);
-
-    return totalSecondsToNextWakeup;
+int getCurrentCycleNumber(const DateTime& currentTime) {
+    int minutesSinceHourStart = currentTime.minute() % 8; // Get the minutes within the current 8-minute window
+    return minutesSinceHourStart / 2; // Divide by 2 to get the cycle number (0 to 3)
 }
 
+int calculateSleepDuration(const DateTime& currentTime) {
+    int minutesSinceHourStart = currentTime.minute() % 8;
+    int secondsSinceCycleStart = (minutesSinceHourStart % 2) * 60 + currentTime.second();
+    int sleepDuration = (2 * 60) - secondsSinceCycleStart;
 
+    // Add 5 seconds as a buffer
+    sleepDuration += 5;
 
+    // Ensure sleep duration does not exceed the cycle length
+    if (sleepDuration > (2 * 60)) {
+        sleepDuration = (2 * 60);
+    }
+
+    return sleepDuration;
+}
 
 String formatDateTime(const DateTime& dt) {
   char buffer[20];
@@ -429,7 +466,7 @@ String getDataReading(){
 
 }
 
-void WriteFile(const char * path, String data) {
+void appendFile(const char * path, String data) {
     File dataFile = SD.open(path, FILE_APPEND);
     
     if (dataFile) {
@@ -443,37 +480,55 @@ void WriteFile(const char * path, String data) {
 }
 
 
-void ReadFile(const char * path){
-  // open the file for reading:
-  dataFile = SD.open(path);
-  if (dataFile) {
-     debug("Reading file from: ");
-     debugln(path);
-     // read from the file until there's nothing else in it:
-    while (dataFile.available()) {
-      Serial.write(dataFile.read());
+String readFile(const char * path) {
+    String fileContent = "";
+    File dataFile = SD.open(path);
+
+    if (dataFile) {
+        debug("Reading file from: ");
+        debugln(path);
+
+        while (dataFile.available()) {
+            String line = dataFile.readStringUntil('\n');
+            fileContent += line;
+            if (dataFile.available()) { // Check if there are more lines to read
+                fileContent += ','; // Append a comma for each line except the last one
+            }
+        }
+        dataFile.close();
+    } else {
+        debugln("Error opening file");
     }
-    dataFile.close(); // close the file:
-  } 
-  else {
-    // if the file didn't open, print an error:
-    debugln("error opening file");
-  }
+
+    return fileContent;
 }
 
-void setEEPROM() {
-  const int addr = 0;
-  const int value = 0;
-  const int maxValue = 4;
-  // read the current value at this address
-  EEPROM.get(addr, value);
-  // check that the current value is valid, if not then set to 0
-  if (value < 0 || value > maxValue) {
-    EEPROM.put(addr, value);
-    EEPROM.commit();
-    debugln("EEPROM initialized with 1");
-  }
+
+void clearFile(const char * path) {
+    File dataFile = SD.open(path, FILE_WRITE);
+    
+    if (dataFile) {
+        debugln("Clearing: " + String(path));
+        dataFile.close();
+        debugln("Clear file completed.");
+    } else {
+        debugln("Error opening file for read: " + String(path));
+    }
 }
+
+// void setEEPROM() {
+//   const int addr = 0;
+//   const int value = 0;
+//   const int maxValue = 4;
+//   // read the current value at this address
+//   EEPROM.get(addr, value);
+//   // check that the current value is valid, if not then set to 0
+//   if (value < 0 || value > maxValue) {
+//     EEPROM.put(addr, value);
+//     EEPROM.commit();
+//     debugln("EEPROM initialized with 1");
+//   }
+// }
 
 String formatJson(String timestamp, float temp, float humidity) {
   // Prepare JSON data
