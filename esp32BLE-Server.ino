@@ -1,9 +1,8 @@
 
 #include <ArduinoJson.h>
 #include <DHT.h>
-// #include <EEPROM.h>
-#include <ESP32Time.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 #include <RTClib.h>
 #include <SPI.h>
 #include <SD.h>
@@ -23,6 +22,9 @@
 // real time clock
 RTC_DS3231 rtc;
 
+// non-volatile storage
+Preferences preferences;
+
 int timeslot_offset = 0; // Offset in minutes
 const int cycleDuration = 2; // Duration of each cycle in minutes should be 15min, set to 1 for testing
 esp_sleep_wakeup_cause_t wakeup_reason; // what cause the wake up of this device
@@ -37,18 +39,14 @@ bool sdCardInitialized = false;
 #define DHTTYPE DHT22
 DHT dht(DHTPIN, DHTTYPE);
 
-// EEPROM variables
 int currentCycleNumber;
-const int maxCycleNumber = 3;  
-const int addr = 0; // memory address
+const int cycleNumber = 0;  // the cyclke number that the system makes data available on
 
 bool dataTransmissionSuccess = false;
 
-
-
-
 // statmachine enum
 enum class programState: uint8_t {
+  SET_RTC_TIME,
   TIME_CONFIG,
   READ_SAVE_SLEEP,
   ADVERTISE_DATA_SLEEP
@@ -68,9 +66,11 @@ static NimBLEServer* pServer;
 NimBLEAdvertising* pAdvertising = nullptr;
 
 NimBLECharacteristic* pDHTCharacteristic;  // Global declaration
+NimBLECharacteristic* pRTCTimeCharacteristic; 
 
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define DATA_CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define TIME_CHARACTERISTIC_UUID "7eb5483e-36e1-4688-b7f5-ea07361b26a7"
 #define RESPONSE_CHARACTERISTIC_UUID "aeb5483e-36e1-4688-b7f5-ea07361b26a9"
 #define DESCRIPTION_UUID "3d069557-f145-4152-9fd8-8d2a61864949"
 
@@ -150,6 +150,59 @@ class DHTCallbacks: public NimBLECharacteristicCallbacks {
 };
 
 /** Handler class for characteristic actions */
+class RTCTimeCallbacks: public NimBLECharacteristicCallbacks {
+    void onRead(NimBLECharacteristic* pCharacteristic){
+      debugln("############ RTCTimeCallbacks onRead called, client read data");
+
+      // Check if RTC is running
+      if (!rtc.begin()) {
+          debugln("RTC Not Running");
+          pCharacteristic->setValue("RTC Error");
+          return;
+      }
+
+      // Read current time from RTC
+      DateTime now = rtc.now();
+
+      // Format time into a string (e.g., "YYYY-MM-DD HH:MM:SS")
+      char timeStr[20];
+      snprintf(timeStr, sizeof(timeStr), "%04d-%02d-%02d %02d:%02d:%02d", 
+                now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second());
+
+      // Set the characteristic's value to the formatted time
+      pCharacteristic->setValue(timeStr);
+
+
+      debug(pCharacteristic->getUUID().toString().c_str());
+      debug(": onRead(), value: ");
+      debugln(pCharacteristic->getValue().c_str());
+    };
+
+    void onWrite(NimBLECharacteristic* pCharacteristic) override {
+        debugln("############ RTCTimeCallbacks onWrite called, client wrote data");
+
+        std::string writtenValue = pCharacteristic->getValue();
+        debug("Written value: ");
+        debugln(writtenValue.c_str());
+
+        // Parse the time string (assuming format: "YYYY-MM-DDTHH:MM:SS")
+        int year, month, day, hour, minute, second;
+        if (sscanf(writtenValue.c_str(), "%d-%d-%dT%d:%d:%d", &year, &month, &day, &hour, &minute, &second) == 6) {
+            // Set the RTC time
+            rtc.adjust(DateTime(year, month, day, hour, minute, second));
+            debugln("RTC time adjusted based on written value.");
+            preferences.begin("beevibe_sensor_server", false); // Open NVS in RW mode with namespace "beevibe_sensor_server"
+            preferences.putBool("rtcSet", true); // Set the flag to true once RTC is set
+            preferences.end(); // Close NVS storage
+        } else {
+            debugln("Invalid time format received.");
+        }
+    };
+
+
+};
+
+/** Handler class for characteristic actions */
 class ResponseCallbacks: public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pCharacteristic) {
       debugln("############ onWrite called, response from client recived");
@@ -175,7 +228,9 @@ class DescriptorCallbacks : public NimBLEDescriptorCallbacks {
 /** Define callback instances globally to use for multiple Charateristics \ Descriptors */
 static DescriptorCallbacks dscriptionCallbacks;
 static DHTCallbacks DHTCallbacks;
+static RTCTimeCallbacks RTCTimeCallbacks;
 static ResponseCallbacks responseCallbacks;
+
 
 //################### setup ############################
 void setup() {
@@ -190,9 +245,6 @@ void setup() {
     while (1);
   }
 
-  // // initialize EEPROM 
-  // EEPROM.begin(512); 
-  // setEEPROM();
 
   // initialize dht sensor
   dht.begin();
@@ -232,6 +284,12 @@ void setup() {
 
 
   NimBLEService* pDHTService = pServer->createService(SERVICE_UUID);
+
+ pRTCTimeCharacteristic = pDHTService->createCharacteristic(
+                                TIME_CHARACTERISTIC_UUID,
+                                NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE
+                             );
+    pRTCTimeCharacteristic->setCallbacks(&RTCTimeCallbacks);
 
  pDHTCharacteristic = pDHTService->createCharacteristic(
                                               DATA_CHARACTERISTIC_UUID,
@@ -287,30 +345,67 @@ void loop() {
 
 //################### Finite state machine handles sensor operation, sleep and BLE comms ############################
 void programStateMachine(){
+    programState currentState;
 
-   // if (wakeup_reason != ESP_SLEEP_WAKEUP_TIMER) {
-    //     // Calculate the current cycle number only if not woken up by a timer
-    //     int calculatedCurrentCycleNumber = getCurrentCycleNumber(rtc.now());
-    //     debug("################ the calculatedCycleNumber is: ");
-    //     debugln(calculatedCurrentCycleNumber);
-    // }
-    // print the current time
+    // initialize NVS storage
+    preferences.begin("beevibe_sensor_server", false); // Open NVS in RW mode with namespace "beevibe_sensor_server"
+
+    // Check if RTC is set
+    bool rtcSet = preferences.getBool("rtcSet", false); // Default to false
+
+    if (!rtcSet) {
+      debugln("RTC is not set. Staying awake to set RTC.");
+      programState currentState = programState::SET_RTC_TIME;
+      
+    } else {
+      debugln("RTC is already set. Proceeding with regular operation.");
+      programState currentState = programState::READ_SAVE_SLEEP;
+    }
+
+    preferences.end(); // Close NVS storage
     
     DateTime now = rtc.now();
     int calculatedCurrentCycleNumber = getCurrentCycleNumber(now);
         debug("################ the calculatedCycleNumber is: ");
         debugln(calculatedCurrentCycleNumber);
 
-  // read cycle number from EEPROM
-  // EEPROM.get(addr, currentCycleNumber);
 
-  static unsigned long timer = millis();
-  static unsigned long MAXADVERTISINGTIME = 1*10000;
+    static unsigned long timer = millis();
+    static unsigned long MAXADVERTISINGTIME = 1*10000;
 
-  // track current state
-  static programState currentState = programState::READ_SAVE_SLEEP;
+  
 
   switch (currentState) {
+    case programState::SET_RTC_TIME:
+    static unsigned long startTime;
+    static const unsigned long TIMEOUT_PERIOD = 60 * 60 * 1000; // 60 minutes in milliseconds
+    static const uint64_t DEEP_SLEEP_DURATION = 15 * 60 * 1000000; // 15 minutes in microseconds
+    
+    
+    // Check if already advertising
+    if (!pAdvertising->isAdvertising()) {
+        debugln("about to start advertising so the current time can be read and adjusted if nessuary");
+        pAdvertising->start();
+        debugln("Started advertising.");
+    } else {
+        debugln("Already advertising.");
+    }
+
+    // Start the timer for timeout
+    if (startTime == 0) {
+        startTime = millis();
+    }
+
+    // Check for timeout
+    if (millis() - startTime > TIMEOUT_PERIOD) {
+        debugln("Timeout reached, going to deep sleep for 15 minutes");
+        esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION);
+        esp_deep_sleep_start();
+    }
+
+    delay(2000);
+    
+    break;
     // ################# CASE READ_SAVE_SLEEP ##################
     case programState::READ_SAVE_SLEEP:
     debugln("READ_SAVE_SLEEP CALLED");
@@ -320,22 +415,12 @@ void programStateMachine(){
       // print state
       debugln("program state READ_SAVE_SLEEP called ");
       // condition to switch state
-      if (calculatedCurrentCycleNumber == maxCycleNumber){
+      if (calculatedCurrentCycleNumber == cycleNumber){
           currentState = programState::ADVERTISE_DATA_SLEEP;
           //set timer to current millis to be used in ADVERTISE_DATA_SLEEP state to trigger stop advertising
           timer = millis();
           break;
-      }else{
-        
-        // String data = getDataReading();
-        // debugln(data);
-        // appendFile("/data.txt", data);
-
-        // currentCycleNumber++;
-        // currentCycleNumber = calculatedCurrentCycleNumber;
-        // EEPROM.put(addr, currentCycleNumber);
-        // EEPROM.commit();
-        // set deep sleep timer  
+      }else{  
         debugln("Going to sleep");
         esp_sleep_enable_timer_wakeup((uint64_t)calculateSleepDuration(rtc.now()) * 1000000);
         esp_deep_sleep_start();
@@ -361,9 +446,7 @@ void programStateMachine(){
       if (millis() - timer >= MAXADVERTISINGTIME){ 
         debugln("Setting up to sleep");
         haveDataAndAdvertising = false; // Reset the flag
-        // currentCycleNumber = 0;
-        // EEPROM.put(addr, currentCycleNumber);
-        // EEPROM.commit();
+
         debugln("Going to sleep");
         // sets sleep timer to however many seconds there are untill the next quater hour (timeslot offset to be included).
         esp_sleep_enable_timer_wakeup((uint64_t)calculateSleepDuration(rtc.now()) * 1000000); 
@@ -516,19 +599,6 @@ void clearFile(const char * path) {
     }
 }
 
-// void setEEPROM() {
-//   const int addr = 0;
-//   const int value = 0;
-//   const int maxValue = 4;
-//   // read the current value at this address
-//   EEPROM.get(addr, value);
-//   // check that the current value is valid, if not then set to 0
-//   if (value < 0 || value > maxValue) {
-//     EEPROM.put(addr, value);
-//     EEPROM.commit();
-//     debugln("EEPROM initialized with 1");
-//   }
-// }
 
 String formatJson(String timestamp, float temp, float humidity) {
   // Prepare JSON data
